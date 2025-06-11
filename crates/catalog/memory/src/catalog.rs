@@ -277,11 +277,69 @@ impl Catalog for MemoryCatalog {
     }
 
     /// Update a table to the catalog.
-    async fn update_table(&self, _commit: TableCommit) -> Result<Table> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "MemoryCatalog does not currently support updating tables.",
-        ))
+    async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
+        let mut root_namespace_state = self.root_namespace_state.lock().await;
+        // Get table identifier first before we mutably borrow commit
+        let table_ident = commit.identifier().clone();
+
+        // Check if the table exists
+        if !root_namespace_state.table_exists(&table_ident)? {
+            return Err(Error::new(
+                ErrorKind::TableNotFound,
+                format!("Cannot update non-existent table: {:?}", table_ident),
+            ));
+        }
+
+        // Get the existing metadata location
+        let old_metadata_location = root_namespace_state.get_existing_table_location(&table_ident)?;
+
+        // Load the existing metadata
+        let input_file = self.file_io.new_input(old_metadata_location)?;
+        let existing_metadata_content = input_file.read().await?;
+        let existing_metadata = serde_json::from_slice::<TableMetadata>(&existing_metadata_content)?;
+
+        // Get requirements and updates from commit
+        let requirements = commit.take_requirements();
+        let updates = commit.take_updates();
+
+        // Check all requirements
+        for requirement in requirements {
+            requirement.check(Some(&existing_metadata))?;
+        }
+
+        // Apply updates to create new metadata
+        let mut builder = TableMetadataBuilder::new_from_metadata(existing_metadata, Some(old_metadata_location.to_string()));
+        for update in updates {
+            builder = update.apply(builder)?;
+        }
+        let updated_metadata = builder.build()?.metadata;
+
+        // Generate new metadata path (format: metadata/uuid-seqno.metadata.json)
+        let table_location = updated_metadata.location();
+        let metadata_location = format!(
+            "{}/metadata/{}-{}.metadata.json",
+            table_location,
+            updated_metadata.last_sequence_number(),
+            uuid::Uuid::new_v4()
+        );
+
+        // Write the updated metadata
+        self.file_io
+            .new_output(&metadata_location)?
+            .write(serde_json::to_vec(&updated_metadata)?.into())
+            .await?;
+
+        // Remove the old table entry and insert the new one
+        root_namespace_state.remove_existing_table(&table_ident)?;
+        root_namespace_state.insert_new_table(&table_ident, metadata_location.clone())?;
+
+        // Return the updated table
+        Table::builder()
+            .file_io(self.file_io.clone())
+            .metadata_location(metadata_location)
+            .metadata(updated_metadata)
+            .identifier(table_ident.clone())
+            .build()
     }
 }
 
@@ -328,9 +386,12 @@ mod tests {
 
     fn simple_table_schema() -> Schema {
         Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "foo", Type::Primitive(PrimitiveType::Int)).into(),
-            ])
+            .with_fields(vec![NestedField::required(
+                1,
+                "foo",
+                Type::Primitive(PrimitiveType::Int),
+            )
+            .into()])
             .build()
             .unwrap()
     }
@@ -414,9 +475,10 @@ mod tests {
         let namespace_ident = NamespaceIdent::new("abc".into());
         create_namespace(&catalog, &namespace_ident).await;
 
-        assert_eq!(catalog.list_namespaces(None).await.unwrap(), vec![
-            namespace_ident
-        ]);
+        assert_eq!(
+            catalog.list_namespaces(None).await.unwrap(),
+            vec![namespace_ident]
+        );
     }
 
     #[tokio::test]
@@ -438,11 +500,10 @@ mod tests {
         let namespace_ident_1 = NamespaceIdent::new("a".into());
         let namespace_ident_2 = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_3 = NamespaceIdent::new("b".into());
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_1,
-            &namespace_ident_2,
-            &namespace_ident_3,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![&namespace_ident_1, &namespace_ident_2, &namespace_ident_3],
+        )
         .await;
 
         assert_eq!(
@@ -473,11 +534,10 @@ mod tests {
         let namespace_ident_1 = NamespaceIdent::new("a".into());
         let namespace_ident_2 = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_3 = NamespaceIdent::new("c".into());
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_1,
-            &namespace_ident_2,
-            &namespace_ident_3,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![&namespace_ident_1, &namespace_ident_2, &namespace_ident_3],
+        )
         .await;
 
         assert_eq!(
@@ -502,13 +562,16 @@ mod tests {
         let namespace_ident_3 = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_4 = NamespaceIdent::from_strs(vec!["a", "c"]).unwrap();
         let namespace_ident_5 = NamespaceIdent::new("b".into());
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_1,
-            &namespace_ident_2,
-            &namespace_ident_3,
-            &namespace_ident_4,
-            &namespace_ident_5,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_1,
+                &namespace_ident_2,
+                &namespace_ident_3,
+                &namespace_ident_4,
+                &namespace_ident_5,
+            ],
+        )
         .await;
 
         assert_eq!(
@@ -532,12 +595,10 @@ mod tests {
         let namespace_ident = NamespaceIdent::new("a".into());
         create_namespace(&catalog, &namespace_ident).await;
 
-        assert!(
-            !catalog
-                .namespace_exists(&NamespaceIdent::new("b".into()))
-                .await
-                .unwrap()
-        );
+        assert!(!catalog
+            .namespace_exists(&NamespaceIdent::new("b".into()))
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -681,8 +742,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_deeply_nested_namespace_throws_error_if_intermediate_namespace_doesnt_exist()
-     {
+    async fn test_create_deeply_nested_namespace_throws_error_if_intermediate_namespace_doesnt_exist(
+    ) {
         let catalog = new_memory_catalog();
 
         let namespace_ident_a = NamespaceIdent::new("a".into());
@@ -702,9 +763,10 @@ mod tests {
             )
         );
 
-        assert_eq!(catalog.list_namespaces(None).await.unwrap(), vec![
-            namespace_ident_a.clone()
-        ]);
+        assert_eq!(
+            catalog.list_namespaces(None).await.unwrap(),
+            vec![namespace_ident_a.clone()]
+        );
 
         assert_eq!(
             catalog
@@ -752,11 +814,14 @@ mod tests {
         let namespace_ident_a = NamespaceIdent::new("a".into());
         let namespace_ident_a_b = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_a_b_c = NamespaceIdent::from_strs(vec!["a", "b", "c"]).unwrap();
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_a,
-            &namespace_ident_a_b,
-            &namespace_ident_a_b_c,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_a,
+                &namespace_ident_a_b,
+                &namespace_ident_a_b_c,
+            ],
+        )
         .await;
 
         assert_eq!(
@@ -831,11 +896,14 @@ mod tests {
         let namespace_ident_a = NamespaceIdent::new("a".into());
         let namespace_ident_a_b = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_a_b_c = NamespaceIdent::from_strs(vec!["a", "b", "c"]).unwrap();
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_a,
-            &namespace_ident_a_b,
-            &namespace_ident_a_b_c,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_a,
+                &namespace_ident_a_b,
+                &namespace_ident_a_b_c,
+            ],
+        )
         .await;
 
         let mut new_properties = HashMap::new();
@@ -891,12 +959,10 @@ mod tests {
 
         catalog.drop_namespace(&namespace_ident_a_b).await.unwrap();
 
-        assert!(
-            !catalog
-                .namespace_exists(&namespace_ident_a_b)
-                .await
-                .unwrap()
-        );
+        assert!(!catalog
+            .namespace_exists(&namespace_ident_a_b)
+            .await
+            .unwrap());
 
         assert!(catalog.namespace_exists(&namespace_ident_a).await.unwrap());
     }
@@ -907,11 +973,14 @@ mod tests {
         let namespace_ident_a = NamespaceIdent::new("a".into());
         let namespace_ident_a_b = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_a_b_c = NamespaceIdent::from_strs(vec!["a", "b", "c"]).unwrap();
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_a,
-            &namespace_ident_a_b,
-            &namespace_ident_a_b_c,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_a,
+                &namespace_ident_a_b,
+                &namespace_ident_a_b_c,
+            ],
+        )
         .await;
 
         catalog
@@ -919,19 +988,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            !catalog
-                .namespace_exists(&namespace_ident_a_b_c)
-                .await
-                .unwrap()
-        );
+        assert!(!catalog
+            .namespace_exists(&namespace_ident_a_b_c)
+            .await
+            .unwrap());
 
-        assert!(
-            catalog
-                .namespace_exists(&namespace_ident_a_b)
-                .await
-                .unwrap()
-        );
+        assert!(catalog
+            .namespace_exists(&namespace_ident_a_b)
+            .await
+            .unwrap());
 
         assert!(catalog.namespace_exists(&namespace_ident_a).await.unwrap());
     }
@@ -985,12 +1050,10 @@ mod tests {
 
         assert!(!catalog.namespace_exists(&namespace_ident_a).await.unwrap());
 
-        assert!(
-            !catalog
-                .namespace_exists(&namespace_ident_a_b)
-                .await
-                .unwrap()
-        );
+        assert!(!catalog
+            .namespace_exists(&namespace_ident_a_b)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -1023,13 +1086,11 @@ mod tests {
 
         assert_table_eq(&table, &expected_table_ident, &simple_table_schema());
 
-        assert!(
-            table
-                .metadata_location()
-                .unwrap()
-                .to_string()
-                .starts_with(&location)
-        )
+        assert!(table
+            .metadata_location()
+            .unwrap()
+            .to_string()
+            .starts_with(&location))
     }
 
     #[tokio::test]
@@ -1074,8 +1135,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_table_in_nested_namespace_falls_back_to_nested_namespace_location_if_table_location_is_missing()
-     {
+    async fn test_create_table_in_nested_namespace_falls_back_to_nested_namespace_location_if_table_location_is_missing(
+    ) {
         let file_io = FileIOBuilder::new_fs_io().build().unwrap();
         let warehouse_location = temp_path();
         let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));
@@ -1127,8 +1188,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_table_falls_back_to_warehouse_location_if_both_table_location_and_namespace_location_are_missing()
-     {
+    async fn test_create_table_falls_back_to_warehouse_location_if_both_table_location_and_namespace_location_are_missing(
+    ) {
         let file_io = FileIOBuilder::new_fs_io().build().unwrap();
         let warehouse_location = temp_path();
         let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));
@@ -1168,8 +1229,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_table_in_nested_namespace_falls_back_to_warehouse_location_if_both_table_location_and_namespace_location_are_missing()
-     {
+    async fn test_create_table_in_nested_namespace_falls_back_to_warehouse_location_if_both_table_location_and_namespace_location_are_missing(
+    ) {
         let file_io = FileIOBuilder::new_fs_io().build().unwrap();
         let warehouse_location = temp_path();
         let catalog = MemoryCatalog::new(file_io, Some(warehouse_location.clone()));
@@ -1216,8 +1277,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_table_throws_error_if_table_location_and_namespace_location_and_warehouse_location_are_missing()
-     {
+    async fn test_create_table_throws_error_if_table_location_and_namespace_location_and_warehouse_location_are_missing(
+    ) {
         let file_io = FileIOBuilder::new_fs_io().build().unwrap();
         let catalog = MemoryCatalog::new(file_io, None);
 
@@ -1296,9 +1357,10 @@ mod tests {
         let table_ident = TableIdent::new(namespace_ident.clone(), "tbl1".into());
         create_table(&catalog, &table_ident).await;
 
-        assert_eq!(catalog.list_tables(&namespace_ident).await.unwrap(), vec![
-            table_ident
-        ]);
+        assert_eq!(
+            catalog.list_tables(&namespace_ident).await.unwrap(),
+            vec![table_ident]
+        );
     }
 
     #[tokio::test]
@@ -1327,11 +1389,10 @@ mod tests {
         let table_ident_1 = TableIdent::new(namespace_ident_1.clone(), "tbl1".into());
         let table_ident_2 = TableIdent::new(namespace_ident_1.clone(), "tbl2".into());
         let table_ident_3 = TableIdent::new(namespace_ident_2.clone(), "tbl1".into());
-        let _ = create_tables(&catalog, vec![
-            &table_ident_1,
-            &table_ident_2,
-            &table_ident_3,
-        ])
+        let _ = create_tables(
+            &catalog,
+            vec![&table_ident_1, &table_ident_2, &table_ident_3],
+        )
         .await;
 
         assert_eq!(
@@ -1469,12 +1530,10 @@ mod tests {
         create_namespace(&catalog, &namespace_ident).await;
         let non_existent_table_ident = TableIdent::new(namespace_ident.clone(), "tbl1".into());
 
-        assert!(
-            !catalog
-                .table_exists(&non_existent_table_ident)
-                .await
-                .unwrap()
-        );
+        assert!(!catalog
+            .table_exists(&non_existent_table_ident)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -1490,12 +1549,10 @@ mod tests {
         assert!(catalog.table_exists(&table_ident).await.unwrap());
 
         let non_existent_table_ident = TableIdent::new(namespace_ident_a_b.clone(), "tbl2".into());
-        assert!(
-            !catalog
-                .table_exists(&non_existent_table_ident)
-                .await
-                .unwrap()
-        );
+        assert!(!catalog
+            .table_exists(&non_existent_table_ident)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -1533,9 +1590,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(catalog.list_tables(&namespace_ident).await.unwrap(), vec![
-            dst_table_ident
-        ],);
+        assert_eq!(
+            catalog.list_tables(&namespace_ident).await.unwrap(),
+            vec![dst_table_ident],
+        );
     }
 
     #[tokio::test]
@@ -1577,9 +1635,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(catalog.list_tables(&namespace_ident).await.unwrap(), vec![
-            table_ident
-        ],);
+        assert_eq!(
+            catalog.list_tables(&namespace_ident).await.unwrap(),
+            vec![table_ident],
+        );
     }
 
     #[tokio::test]
@@ -1588,11 +1647,14 @@ mod tests {
         let namespace_ident_a = NamespaceIdent::new("a".into());
         let namespace_ident_a_b = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_a_b_c = NamespaceIdent::from_strs(vec!["a", "b", "c"]).unwrap();
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_a,
-            &namespace_ident_a_b,
-            &namespace_ident_a_b_c,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_a,
+                &namespace_ident_a_b,
+                &namespace_ident_a_b_c,
+            ],
+        )
         .await;
 
         let src_table_ident = TableIdent::new(namespace_ident_a_b_c.clone(), "tbl1".into());
