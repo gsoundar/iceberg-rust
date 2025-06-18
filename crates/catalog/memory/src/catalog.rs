@@ -291,12 +291,14 @@ impl Catalog for MemoryCatalog {
         }
 
         // Get the existing metadata location
-        let old_metadata_location = root_namespace_state.get_existing_table_location(&table_ident)?;
+        let old_metadata_location =
+            root_namespace_state.get_existing_table_location(&table_ident)?;
 
         // Load the existing metadata
         let input_file = self.file_io.new_input(old_metadata_location)?;
         let existing_metadata_content = input_file.read().await?;
-        let existing_metadata = serde_json::from_slice::<TableMetadata>(&existing_metadata_content)?;
+        let existing_metadata =
+            serde_json::from_slice::<TableMetadata>(&existing_metadata_content)?;
 
         // Get requirements and updates from commit
         let requirements = commit.take_requirements();
@@ -308,7 +310,10 @@ impl Catalog for MemoryCatalog {
         }
 
         // Apply updates to create new metadata
-        let mut builder = TableMetadataBuilder::new_from_metadata(existing_metadata, Some(old_metadata_location.to_string()));
+        let mut builder = TableMetadataBuilder::new_from_metadata(
+            existing_metadata,
+            Some(old_metadata_location.to_string()),
+        );
         for update in updates {
             builder = update.apply(builder)?;
         }
@@ -348,11 +353,9 @@ mod tests {
     use std::collections::HashSet;
     use std::hash::Hash;
     use std::iter::FromIterator;
-    
 
     use iceberg::io::FileIOBuilder;
     use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type};
-    
     use regex::Regex;
     use tempfile::TempDir;
 
@@ -487,10 +490,9 @@ mod tests {
         let namespace_ident = NamespaceIdent::new("abc".into());
         create_namespace(&catalog, &namespace_ident).await;
 
-        assert_eq!(
-            catalog.list_namespaces(None).await.unwrap(),
-            vec![namespace_ident]
-        );
+        assert_eq!(catalog.list_namespaces(None).await.unwrap(), vec![
+            namespace_ident
+        ]);
     }
 
     #[tokio::test]
@@ -512,10 +514,11 @@ mod tests {
         let namespace_ident_1 = NamespaceIdent::new("a".into());
         let namespace_ident_2 = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_3 = NamespaceIdent::new("b".into());
-        create_namespaces(
-            &catalog,
-            &vec![&namespace_ident_1, &namespace_ident_2, &namespace_ident_3],
-        )
+        create_namespaces(&catalog, &vec![
+            &namespace_ident_1,
+            &namespace_ident_2,
+            &namespace_ident_3,
+        ])
         .await;
 
         assert_eq!(
@@ -546,10 +549,11 @@ mod tests {
         let namespace_ident_1 = NamespaceIdent::new("a".into());
         let namespace_ident_2 = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_3 = NamespaceIdent::new("c".into());
-        create_namespaces(
-            &catalog,
-            &vec![&namespace_ident_1, &namespace_ident_2, &namespace_ident_3],
-        )
+        create_namespaces(&catalog, &vec![
+            &namespace_ident_1,
+            &namespace_ident_2,
+            &namespace_ident_3,
+        ])
         .await;
 
         assert_eq!(
@@ -574,16 +578,13 @@ mod tests {
         let namespace_ident_3 = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_4 = NamespaceIdent::from_strs(vec!["a", "c"]).unwrap();
         let namespace_ident_5 = NamespaceIdent::new("b".into());
-        create_namespaces(
-            &catalog,
-            &vec![
-                &namespace_ident_1,
-                &namespace_ident_2,
-                &namespace_ident_3,
-                &namespace_ident_4,
-                &namespace_ident_5,
-            ],
-        )
+        create_namespaces(&catalog, &vec![
+            &namespace_ident_1,
+            &namespace_ident_2,
+            &namespace_ident_3,
+            &namespace_ident_4,
+            &namespace_ident_5,
+        ])
         .await;
 
         assert_eq!(
@@ -775,10 +776,9 @@ mod tests {
             )
         );
 
-        assert_eq!(
-            catalog.list_namespaces(None).await.unwrap(),
-            vec![namespace_ident_a.clone()]
-        );
+        assert_eq!(catalog.list_namespaces(None).await.unwrap(), vec![
+            namespace_ident_a.clone()
+        ]);
 
         assert_eq!(
             catalog
@@ -865,7 +865,11 @@ mod tests {
         // Verify the property was set
         let updated_table = catalog.load_table(&table_ident).await.unwrap();
         assert_eq!(
-            updated_table.metadata().properties().get("test_update").unwrap(),
+            updated_table
+                .metadata()
+                .properties()
+                .get("test_update")
+                .unwrap(),
             "value"
         );
     }
@@ -910,10 +914,14 @@ mod tests {
         create_namespace(&catalog, &namespace_ident).await;
 
         // Create an identifier for a table that doesn't exist
-        let nonexistent_table_ident = TableIdent::new(namespace_ident.clone(), "nonexistent".into());
+        let nonexistent_table_ident =
+            TableIdent::new(namespace_ident.clone(), "nonexistent".into());
 
         // Check that the table does not exist
-        let exists = catalog.table_exists(&nonexistent_table_ident).await.unwrap();
+        let exists = catalog
+            .table_exists(&nonexistent_table_ident)
+            .await
+            .unwrap();
         assert!(!exists);
     }
 
@@ -924,11 +932,35 @@ mod tests {
         create_namespace(&catalog, &namespace_ident).await;
 
         // Create an identifier for a table that doesn't exist
-        let nonexistent_table_ident = TableIdent::new(namespace_ident.clone(), "nonexistent".into());
+        let nonexistent_table_ident =
+            TableIdent::new(namespace_ident.clone(), "nonexistent".into());
 
         // Attempt to load the nonexistent table
         let result = catalog.load_table(&nonexistent_table_ident).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No such table"));
+    }
+
+    #[tokio::test]
+    async fn test_update_table_fails_for_nonexistent_table() {
+        let catalog = new_memory_catalog();
+        let namespace_ident = NamespaceIdent::new("namespace".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let nonexistent_table_ident =
+            TableIdent::new(namespace_ident.clone(), "nonexistent".into());
+
+        let dummy_commit = TableCommit::builder()
+            .ident(nonexistent_table_ident.clone())
+            .updates(vec![])
+            .requirements(vec![])
+            .build();
+
+        let result = catalog.update_table(dummy_commit).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Cannot update non-existent table"));
     }
 }
