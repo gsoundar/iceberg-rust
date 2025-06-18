@@ -475,12 +475,103 @@ impl Catalog for S3TablesCatalog {
 
     /// Updates an existing table within the s3tables catalog.
     ///
-    /// This function is still in development and will always return an error.
-    async fn update_table(&self, _commit: TableCommit) -> Result<Table> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Updating a table is not supported yet",
-        ))
+    /// This function processes a TableCommit object to update the table metadata.
+    /// It verifies that the table exists, validates requirements, applies updates,
+    /// writes new metadata to storage, and updates the metadata location in S3Tables.
+    async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
+        // Get table identifier first before we mutably borrow commit
+        let table_ident = commit.identifier().clone();
+
+        // Check if the table exists
+        if !self.table_exists(&table_ident).await? {
+            return Err(Error::new(
+                ErrorKind::TableNotFound,
+                format!("Cannot update non-existent table: {:?}", table_ident),
+            ));
+        }
+
+        // Load the current table to get existing metadata location
+        let req = self
+            .s3tables_client
+            .get_table()
+            .table_bucket_arn(self.config.table_bucket_arn.clone())
+            .namespace(table_ident.namespace().to_url_string())
+            .name(table_ident.name());
+        let resp = req.send().await.map_err(from_aws_sdk_error)?;
+
+        // Get the existing metadata location
+        let metadata_location = resp.metadata_location().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "Table {} does not have metadata location",
+                    table_ident.name()
+                ),
+            )
+        })?;
+
+        // Load the existing metadata
+        let input_file = self.file_io.new_input(metadata_location)?;
+        let existing_metadata_content = input_file.read().await?;
+        let existing_metadata =
+            serde_json::from_slice::<TableMetadata>(&existing_metadata_content)?;
+
+        // Get requirements and updates from commit
+        let requirements = commit.take_requirements();
+        let updates = commit.take_updates();
+
+        // Check all requirements
+        for requirement in requirements {
+            requirement.check(Some(&existing_metadata))?;
+        }
+
+        // Apply updates to create new metadata
+        let mut builder = TableMetadataBuilder::new_from_metadata(
+            existing_metadata,
+            Some(metadata_location.to_string()),
+        );
+        for update in updates {
+            builder = update.apply(builder)?;
+        }
+        let updated_metadata = builder.build()?.metadata;
+
+        // Generate new metadata path (format: metadata/uuid-seqno.metadata.json)
+        let table_location = updated_metadata.location();
+        let new_metadata_location = format!(
+            "{}/metadata/{}-{}.metadata.json",
+            table_location,
+            updated_metadata.last_sequence_number(),
+            uuid::Uuid::new_v4()
+        );
+
+        // Write the updated metadata
+        self.file_io
+            .new_output(&new_metadata_location)?
+            .write(serde_json::to_vec(&updated_metadata)?.into())
+            .await?;
+
+        // Get the version token required for updating metadata location
+        let version_token = resp.version_token();
+
+        // Update metadata location in S3Tables
+        self.s3tables_client
+            .update_table_metadata_location()
+            .table_bucket_arn(self.config.table_bucket_arn.clone())
+            .namespace(table_ident.namespace().to_url_string())
+            .name(table_ident.name())
+            .metadata_location(new_metadata_location.clone())
+            .version_token(version_token)
+            .send()
+            .await
+            .map_err(from_aws_sdk_error)?;
+
+        // Return the updated table
+        Table::builder()
+            .file_io(self.file_io.clone())
+            .metadata_location(new_metadata_location)
+            .metadata(updated_metadata)
+            .identifier(table_ident)
+            .build()
     }
 }
 
