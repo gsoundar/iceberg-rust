@@ -21,5 +21,9 @@
 
 mod catalog;
 mod utils;
+#[cfg(test)]
+mod test_utils;
+#[cfg(test)]
+mod mock_client;
 
 pub use catalog::*;
